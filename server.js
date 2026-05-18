@@ -1,38 +1,34 @@
-// server.js 完整代码（新增考勤记录全功能）
+// 完整适配Upstash Redis的考勤后端代码，直接复制替换即可
 const express = require('express');
 const bodyParser = require('body-parser');
 const xlsx = require('xlsx');
-const fs = require('fs');
 const path = require('path');
+const { Redis } = require('@upstash/redis');
 const app = express();
-const port = 3000;
 
+// 1. 核心配置：适配Vercel自动分配的端口
+const PORT = process.env.PORT || 3000;
+
+// 2. 初始化Upstash Redis连接（自动读取Vercel环境变量，不用手动改）
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
+});
+
+// 3. 中间件配置：解析JSON+微信小程序跨域适配
 app.use(bodyParser.json());
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
-// -------------------------- 配置文件路径 --------------------------
-// 员工信息Excel（你原来的HR.xlsx）
+// 4. 只读文件配置：HR.xlsx是部署时上传的，只读文件系统可正常读取
 const HR_FILE_PATH = path.join(__dirname, 'HR.xlsx');
-// 考勤记录Excel（自动创建，用来存所有打卡记录）
-const ATTENDANCE_FILE_PATH = path.join(__dirname, 'attendance.xlsx');
 
-// -------------------------- 工具函数：初始化考勤Excel --------------------------
-function initAttendanceExcel() {
-  // 如果考勤文件不存在，自动创建
-  if (!fs.existsSync(ATTENDANCE_FILE_PATH)) {
-    const workbook = xlsx.utils.book_new();
-    // 创建考勤记录表头
-    const header = [
-      '打卡ID', '用户代码', '用户姓名', '所属分部',
-      '打卡时间', '打卡纬度', '打卡经度', '打卡照片数量'
-    ];
-    const sheet = xlsx.utils.aoa_to_sheet([header]);
-    xlsx.utils.book_append_sheet(workbook, sheet, '考勤记录');
-    xlsx.writeFile(workbook, ATTENDANCE_FILE_PATH);
-    console.log('✅ 考勤记录Excel文件已自动创建');
-  }
-}
-
-// -------------------------- 工具函数：读取员工信息 --------------------------
+// 5. 工具函数：读取员工信息（和你原来的逻辑完全一致）
 function getAccountMap() {
   try {
     const workbook = xlsx.readFile(HR_FILE_PATH);
@@ -64,34 +60,31 @@ function getAccountMap() {
   }
 }
 
-// -------------------------- 工具函数：新增考勤记录 --------------------------
-function addAttendanceRecord(record) {
+// 6. 工具函数：新增考勤记录到Upstash Redis
+async function addAttendanceRecord(record) {
   try {
-    // 读取现有考勤文件
-    const workbook = xlsx.readFile(ATTENDANCE_FILE_PATH);
-    const sheet = workbook.Sheets['考勤记录'];
-    const data = xlsx.utils.sheet_to_json(sheet);
-    
-    // 生成唯一打卡ID（时间戳+随机数）
+    // 生成唯一打卡ID
     const recordId = Date.now() + '-' + Math.floor(Math.random() * 1000);
-    // 新增记录
+    // 构造考勤记录
     const newRecord = {
-      '打卡ID': recordId,
-      '用户代码': record.userCode,
-      '用户姓名': record.userName,
-      '所属分部': record.userDept,
-      '打卡时间': new Date().toLocaleString('zh-CN'), // 本地时间格式
-      '打卡纬度': record.latitude,
-      '打卡经度': record.longitude,
-      '打卡照片数量': record.photoCount
+      recordId,
+      userCode: record.userCode,
+      userName: record.userName,
+      userDept: record.userDept,
+      checkInTime: new Date().toLocaleString('zh-CN'),
+      latitude: record.latitude,
+      longitude: record.longitude,
+      photoCount: record.photoCount || 0
     };
-    
-    data.push(newRecord);
-    // 写回Excel
-    const newSheet = xlsx.utils.json_to_sheet(data);
-    workbook.Sheets['考勤记录'] = newSheet;
-    xlsx.writeFile(workbook, ATTENDANCE_FILE_PATH);
-    
+
+    // 1. 存单条打卡记录
+    await redis.set(`attendance:${recordId}`, JSON.stringify(newRecord));
+    // 2. 把记录ID添加到该用户的打卡列表，方便后续查询
+    const userRecordsKey = `user:${record.userCode}:attendance`;
+    const userRecords = JSON.parse(await redis.get(userRecordsKey) || '[]');
+    userRecords.unshift(recordId); // 最新记录放最前面
+    await redis.set(userRecordsKey, JSON.stringify(userRecords));
+
     console.log('✅ 考勤记录已保存，打卡ID：', recordId);
     return { success: true, recordId };
   } catch (error) {
@@ -100,27 +93,29 @@ function addAttendanceRecord(record) {
   }
 }
 
-// -------------------------- 工具函数：获取用户历史考勤记录 --------------------------
-function getUserAttendanceHistory(userCode) {
+// 7. 工具函数：获取用户历史考勤记录
+async function getUserAttendanceHistory(userCode) {
   try {
-    const workbook = xlsx.readFile(ATTENDANCE_FILE_PATH);
-    const sheet = workbook.Sheets['考勤记录'];
-    const data = xlsx.utils.sheet_to_json(sheet);
+    // 1. 先获取该用户的所有打卡记录ID
+    const userRecordsKey = `user:${userCode}:attendance`;
+    const recordIds = JSON.parse(await redis.get(userRecordsKey) || '[]');
     
-    // 筛选该用户的所有记录，按时间倒序
-    const userRecords = data
-      .filter(item => item['用户代码'] === userCode)
-      .sort((a, b) => new Date(b['打卡时间']) - new Date(a['打卡时间']));
-    
-    console.log(`✅ 已获取用户${userCode}的历史考勤记录，共${userRecords.length}条`);
-    return { success: true, records: userRecords };
+    // 2. 批量获取所有打卡记录详情
+    const records = [];
+    for (const recordId of recordIds) {
+      const recordStr = await redis.get(`attendance:${recordId}`);
+      if (recordStr) records.push(JSON.parse(recordStr));
+    }
+
+    console.log(`✅ 已获取用户${userCode}的历史考勤记录，共${records.length}条`);
+    return { success: true, records };
   } catch (error) {
     console.error('❌ 历史考勤记录读取失败：', error);
     return { success: false, error: error.message };
   }
 }
 
-// -------------------------- 接口1：登录校验 --------------------------
+// 8. 接口1：登录校验（和你原来的逻辑完全一致，小程序不用改）
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
   const inputCode = String(username).trim().replace(/\s/g, '');
@@ -152,8 +147,8 @@ app.post('/api/login', (req, res) => {
   });
 });
 
-// -------------------------- 接口2：提交考勤打卡 --------------------------
-app.post('/api/attendance/submit', (req, res) => {
+// 9. 接口2：提交考勤打卡（适配Redis，小程序不用改）
+app.post('/api/attendance/submit', async (req, res) => {
   const { userCode, userName, userDept, latitude, longitude, photoCount } = req.body;
   
   console.log('📥 收到打卡提交请求：', { userCode, userName, latitude, longitude });
@@ -164,7 +159,7 @@ app.post('/api/attendance/submit', (req, res) => {
   }
 
   // 新增考勤记录
-  const result = addAttendanceRecord({
+  const result = await addAttendanceRecord({
     userCode,
     userName,
     userDept,
@@ -180,8 +175,8 @@ app.post('/api/attendance/submit', (req, res) => {
   }
 });
 
-// -------------------------- 接口3：获取用户历史考勤记录 --------------------------
-app.get('/api/attendance/history', (req, res) => {
+// 10. 接口3：获取用户历史考勤记录（适配Redis，小程序不用改）
+app.get('/api/attendance/history', async (req, res) => {
   const { userCode } = req.query;
   
   console.log('📥 收到历史记录查询请求：用户代码=', userCode);
@@ -190,7 +185,7 @@ app.get('/api/attendance/history', (req, res) => {
     return res.json({ code: 400, msg: '用户代码不能为空' });
   }
 
-  const result = getUserAttendanceHistory(userCode);
+  const result = await getUserAttendanceHistory(userCode);
 
   if (result.success) {
     res.json({ code: 200, msg: '获取成功', data: { records: result.records } });
@@ -199,15 +194,18 @@ app.get('/api/attendance/history', (req, res) => {
   }
 });
 
-// -------------------------- 启动服务 --------------------------
-// 初始化考勤Excel
-initAttendanceExcel();
-// 启动服务
-app.listen(port, () => {
-  console.log(`✅ 考勤打卡后端服务已启动：http://localhost:${port}`);
-  console.log(`📌 登录接口：http://localhost:${port}/api/login`);
-  console.log(`📌 打卡提交接口：http://localhost:${port}/api/attendance/submit`);
-  console.log(`📌 历史记录接口：http://localhost:${port}/api/attendance/history`);
-  // 预读取员工信息
-  getAccountMap();
+// 11. 健康检查接口：验证服务是否正常运行
+app.get('/', (req, res) => {
+  res.send('✅ 考勤打卡后端服务正常运行！已适配Upstash Redis');
 });
+
+// 12. 初始化服务：预读取员工信息
+getAccountMap();
+
+// 13. 启动服务：适配Vercel
+app.listen(PORT, () => {
+  console.log(`✅ 考勤打卡服务已启动，端口：${PORT}`);
+});
+
+// 14. Vercel Serverless函数必须导出app
+module.exports = app;
